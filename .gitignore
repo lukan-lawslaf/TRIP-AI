@@ -1,0 +1,46 @@
+# --- secrets: never commit ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# --- python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- local data stores ---
+Backend/data/*.db
+Backend/data/*.db-journal
+Backend/data/*.db-shm
+Backend/data/*.db-wal
+Backend/data/*.sqlite3
+Backend/data/chroma/
+Backend/data/uploads/
+Backend/.cache/
+
+# --- node / frontend ---
+node_modules/
+frountend/dist/
+dist/
+*.tsbuildinfo
+
+# --- claude code local settings ---
+.claude/settings.local.json
+
+# --- logs ---
+*.log
+logs/
+
+# --- os / editor ---
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
