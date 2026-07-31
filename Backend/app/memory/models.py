@@ -92,6 +92,10 @@ class TripState(BaseModel):
     # Latest backend route as MapLibre-ready GeoJSON. Kept out of the LLM compact
     # context because coordinates are for the frontend renderer, not model reasoning.
     route: dict[str, Any] | None = None
+    # Latest successful tool payloads, keyed by domain (flights/hotels/weather/...).
+    # Same rationale as `route`: this is render data for the dashboard, and synthesis
+    # already saw the raw results in the turn that fetched them.
+    live_data: dict[str, Any] = Field(default_factory=dict)
     updated_at: str = Field(default_factory=_now)
 
     # -- derived views ---------------------------------------------------
@@ -129,7 +133,7 @@ class TripState(BaseModel):
         data = self.model_dump()
 
         for key, value in (partial or {}).items():
-            if key in {"plan_items", "preferences", "updated_at"} or value is None:
+            if key in {"plan_items", "preferences", "live_data", "updated_at"} or value is None:
                 continue
             if key in data:
                 # Don't let an empty list clobber a populated one.
@@ -160,6 +164,14 @@ class TripState(BaseModel):
         if isinstance(items, list) and items:
             data["plan_items"] = _merge_items(data.get("plan_items") or [], items)
 
+        # Per-domain, so a turn that only looked up hotels doesn't discard the
+        # flights fetched a turn earlier.
+        live = (partial or {}).get("live_data")
+        if isinstance(live, dict) and live:
+            merged_live = dict(data.get("live_data") or {})
+            merged_live.update({k: v for k, v in live.items() if v is not None})
+            data["live_data"] = merged_live
+
         data["updated_at"] = _now()
         return TripState.model_validate(data)
 
@@ -168,6 +180,7 @@ class TripState(BaseModel):
         raw = self.model_dump(exclude_none=True)
         raw.pop("updated_at", None)
         raw.pop("route", None)
+        raw.pop("live_data", None)
         prefs = {k: v for k, v in (raw.get("preferences") or {}).items() if v}
         if prefs:
             raw["preferences"] = prefs

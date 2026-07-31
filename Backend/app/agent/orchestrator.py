@@ -141,6 +141,50 @@ def _synthesis_messages(
     ]
 
 
+# Tool name -> the dashboard bucket its payload belongs in. Tools absent from this
+# map (web_search, knowledge_lookup, maps_route) feed the model's reasoning but have
+# no view of their own to render into.
+_LIVE_BUCKETS: dict[str, str] = {
+    "hotel_lookup": "hotels",
+    "restaurant_lookup": "restaurants",
+    "weather_lookup": "weather",
+    "travel_search": "places",
+}
+
+
+def _bucket_for(call: ToolCall) -> str | None:
+    if call.name == "transport_lookup":
+        mode = (call.arguments or {}).get("mode")
+        return "trains" if mode == "train" else "flights"
+    return _LIVE_BUCKETS.get(call.name)
+
+
+def _live_data(pairs: list[tuple[ToolCall, ToolResult]]) -> dict[str, Any]:
+    """Latest successful payload per dashboard bucket.
+
+    Without this the tool results reach synthesis and are then dropped, leaving the
+    frontend nothing to render but its own fixtures — every trip looks identical.
+    """
+    live: dict[str, Any] = {}
+    for call, result in pairs:
+        bucket = _bucket_for(call)
+        if bucket is None or not result.ok or not isinstance(result.data, dict):
+            continue
+        live[bucket] = {
+            **result.data,
+            "_source": result.source,
+            "_query": call.arguments or {},
+        }
+    return live
+
+
+def _place_key(state: Any) -> str | None:
+    """Primary destination city, normalized for comparison across turns."""
+    destination = getattr(state, "primary_destination", None)
+    city = getattr(destination, "city", None)
+    return city.strip().lower() if isinstance(city, str) and city.strip() else None
+
+
 def _latest_route(tool_results: list[ToolResult]) -> dict[str, Any] | None:
     """Keep the latest successful MapLibre-ready route in session state."""
     for result in reversed(tool_results):
@@ -181,9 +225,25 @@ async def run_turn(
         session_id,
         memory.turn_from_user(user_text, media_count=len(media)),
     )
+    prior_place = _place_key(await db.get_trip_state(session_id))
     state = await memory.update_from_user_turn(
         session_id, user_text, router=router
     )
+
+    # A new destination invalidates everything fetched for the old one. Without this
+    # the dashboard keeps rendering the previous city's flights and hotels for any
+    # domain the model doesn't happen to re-query this turn.
+    place = _place_key(state)
+    if prior_place and place and prior_place != place:
+        logger.info(
+            "agent.destination_changed session=%s %s -> %s",
+            session_id,
+            prior_place,
+            place,
+        )
+        state = state.model_copy(update={"live_data": {}, "route": None})
+        await db.save_trip_state(session_id, state)
+
     context = await memory.build_context(session_id, user_id=user_id)
 
     messages: list[Message] = [
@@ -199,6 +259,7 @@ async def run_turn(
 
     tool_specs = tool_specs_for_orchestrator()
     tool_results: list[ToolResult] = []
+    call_results: list[tuple[ToolCall, ToolResult]] = []
     used_tools: list[str] = []
     response: LLMResponse | None = None
 
@@ -217,6 +278,7 @@ async def run_turn(
         used_tools.extend(call.name for call in response.tool_calls)
         results = await _dispatch_calls(response.tool_calls)
         tool_results.extend(results)
+        call_results.extend(zip(response.tool_calls, results))
         messages.extend(
             _tool_message(call, result)
             for call, result in zip(response.tool_calls, results)
@@ -262,6 +324,9 @@ async def run_turn(
             state_update["plan_items"] = selected_items
         if route is not None:
             state_update["route"] = route
+        live = _live_data(call_results)
+        if live:
+            state_update["live_data"] = live
         if state_update:
             state = state.merge(state_update)
             await db.save_trip_state(session_id, state)

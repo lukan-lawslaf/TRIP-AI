@@ -35,7 +35,7 @@ import {
   topDeals,
   weatherForecast,
 } from '@/data/mock'
-import type { Flight, Hotel, WeatherDay } from '@/data/mock'
+import type { Flight, Hotel, Restaurant, WeatherDay } from '@/data/mock'
 
 type View = 'wonder' | 'flights' | 'trains' | 'hotels' | 'restaurants' | 'weather' | 'map'
 
@@ -74,83 +74,188 @@ function numberValue(value: unknown, fallback = 0): number {
   return Number.isFinite(number) ? number : fallback
 }
 
-function firstArray(state: TripState, keys: string[]): unknown[] {
-  for (const key of keys) {
-    const value = state[key]
-    if (Array.isArray(value)) return value
-    if (isRecord(value)) {
-      for (const nestedKey of ['items', 'results', 'offers', 'hotels', 'flights', 'days', 'list']) {
-        if (Array.isArray(value[nestedKey])) return value[nestedKey] as unknown[]
-      }
-    }
-  }
-  return []
+// The backend stores each tool's latest payload under trip_state.live_data, keyed by
+// domain. Shapes below mirror Duffel (flights), liteAPI (hotels), OpenWeatherMap
+// (weather) and Foursquare (restaurants) exactly as app/tools/* return them.
+function liveBucket(state: TripState, name: string): DataRecord | null {
+  const live = state.live_data
+  if (!isRecord(live)) return null
+  const bucket = live[name]
+  return isRecord(bucket) ? bucket : null
+}
+
+function bucketRows(bucket: DataRecord | null, key: string): DataRecord[] {
+  const value = bucket?.[key]
+  return Array.isArray(value) ? value.filter(isRecord) : []
+}
+
+const CURRENCY_SYMBOLS: Record<string, string> = { INR: '₹', USD: '$', EUR: '€', GBP: '£', JPY: '¥' }
+
+function currencySymbol(code: unknown, fallback = '₹'): string {
+  const raw = textValue(code).toUpperCase()
+  if (!raw) return fallback
+  return CURRENCY_SYMBOLS[raw] ?? `${raw} `
+}
+
+function clockTime(iso: unknown): string {
+  const parsed = new Date(textValue(iso))
+  return Number.isNaN(parsed.getTime())
+    ? '--:--'
+    : parsed.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' })
+}
+
+function durationLabel(minutes: number): string {
+  if (!minutes) return 'See details'
+  return `${Math.floor(minutes / 60)}h ${String(minutes % 60).padStart(2, '0')}m`
+}
+
+// Duffel returns the carrier's display name but no IATA code, so initials stand in.
+function initials(airline: string): string {
+  const words = airline.replace(/[^A-Za-z ]/g, '').trim().split(/\s+/).filter(Boolean)
+  if (!words.length) return 'AI'
+  return (words.length > 1 ? words[0][0] + words[1][0] : words[0].slice(0, 2)).toUpperCase()
 }
 
 function liveFlights(state: TripState): Flight[] {
-  const rows = firstArray(state, ['flights', 'flight_options', 'flight_results'])
-  return rows.map((value, index): Flight | null => {
-    if (!isRecord(value)) return null
-    const from = textValue(value.from ?? value.origin ?? value.origin_iata, 'DEL')
-    const to = textValue(value.to ?? value.destination ?? value.destination_iata, 'HND')
+  const bucket = liveBucket(state, 'flights')
+  return bucketRows(bucket, 'offers').map((offer, index): Flight => {
+    const slices = Array.isArray(offer.slices) ? offer.slices.filter(isRecord) : []
+    const outbound = slices[0]
+    const segments = Array.isArray(outbound?.segments) ? outbound.segments.filter(isRecord) : []
+    const first = segments[0]
+    const last = segments[segments.length - 1]
+    const airline = textValue(offer.airline, 'Airline')
+    const from = textValue(outbound?.origin ?? first?.origin ?? bucket?.origin, '—')
+    const to = textValue(outbound?.destination ?? last?.destination ?? bucket?.destination, '—')
+    const stops = numberValue(offer.total_stops ?? outbound?.stops)
     return {
-      id: textValue(value.id, `live-flight-${index}`),
-      airline: textValue(value.airline ?? value.carrier ?? value.owner, 'TripAI route'),
-      airlineCode: textValue(value.airlineCode ?? value.airline_code ?? value.carrier_code, 'AI'),
+      id: textValue(offer.offer_id, `offer-${index}`),
+      airline,
+      airlineCode: initials(airline),
       from,
-      fromCity: textValue(value.fromCity ?? value.origin_city, from),
+      fromCity: from,
       to,
-      toCity: textValue(value.toCity ?? value.destination_city, to),
-      departTime: textValue(value.departTime ?? value.depart_time, '--:--'),
-      arriveTime: textValue(value.arriveTime ?? value.arrive_time, '--:--'),
-      duration: textValue(value.duration, 'See details'),
-      stops: numberValue(value.stops, 0),
-      stopCity: textValue(value.stopCity ?? value.stop_city) || undefined,
-      price: numberValue(value.price ?? value.total_amount ?? value.totalAmount),
-      currency: textValue(value.currency ?? value.total_currency, '₹'),
-      cabin: textValue(value.cabin, 'Economy'),
+      toCity: to,
+      departTime: clockTime(first?.departing_at),
+      arriveTime: clockTime(last?.arriving_at),
+      duration: durationLabel(numberValue(offer.total_duration_minutes ?? outbound?.duration_minutes)),
+      stops,
+      stopCity: stops > 0 ? textValue(first?.destination) || undefined : undefined,
+      price: Math.round(numberValue(offer.price_amount)),
+      currency: currencySymbol(offer.price_currency),
+      cabin: textValue(outbound?.fare_brand, 'Economy'),
     }
-  }).filter((value): value is Flight => value !== null)
+  })
 }
+
+const HOTEL_FALLBACK_IMAGE = 'https://images.unsplash.com/photo-1566073771259-6a8506099945?w=800&q=70'
+const FOOD_FALLBACK_IMAGE = 'https://images.unsplash.com/photo-1414235077428-338989a2e8c0?w=800&q=70'
 
 function liveHotels(state: TripState): Hotel[] {
-  const rows = firstArray(state, ['hotels', 'hotel_options', 'hotel_results'])
-  return rows.map((value, index): Hotel | null => {
-    if (!isRecord(value)) return null
-    const city = textValue(value.city, 'Japan')
-    const rawTags = Array.isArray(value.tags) ? value.tags.filter((tag): tag is string => typeof tag === 'string') : []
+  const bucket = liveBucket(state, 'hotels')
+  const city = textValue(bucket?.city, 'Your destination')
+  const bucketCurrency = currencySymbol(bucket?.currency)
+  return bucketRows(bucket, 'hotels').map((row, index): Hotel => {
+    const stars = numberValue(row.stars)
     return {
-      id: textValue(value.id, `live-hotel-${index}`),
-      name: textValue(value.name ?? value.title, 'Selected stay'),
-      area: textValue(value.area ?? value.address, 'Central district'),
+      id: textValue(row.hotel_id, `hotel-${index}`),
+      name: textValue(row.name, 'Selected stay'),
+      area: textValue(row.address, city),
       city,
-      rating: numberValue(value.rating, 0),
-      reviews: numberValue(value.reviews, 0),
-      pricePerNight: numberValue(value.pricePerNight ?? value.price_per_night ?? value.cheapest_price ?? value.price),
-      currency: textValue(value.currency, '₹'),
-      tags: rawTags,
-      image: textValue(value.image ?? value.image_url, 'https://images.unsplash.com/photo-1566073771259-6a8506099945?w=800&q=70'),
+      rating: numberValue(row.rating, stars),
+      reviews: numberValue(row.review_count),
+      pricePerNight: Math.round(numberValue(row.cheapest_price)),
+      currency: row.currency ? currencySymbol(row.currency) : bucketCurrency,
+      tags: stars ? [`${stars}-star`] : [],
+      image: textValue(row.photo, HOTEL_FALLBACK_IMAGE),
     }
-  }).filter((value): value is Hotel => value !== null)
+  })
 }
 
-function liveWeather(state: TripState): { current?: DataRecord; days: WeatherDay[] } {
-  const source = state.weather ?? state.weather_forecast ?? state.forecast
-  const sourceRecord = isRecord(source) ? source : undefined
-  const rows = Array.isArray(source) ? source : sourceRecord ? (sourceRecord.forecast ?? sourceRecord.days ?? sourceRecord.list) : []
-  const current = sourceRecord?.current && isRecord(sourceRecord.current) ? sourceRecord.current : sourceRecord
-  const days = (Array.isArray(rows) ? rows : []).map((value, index) => {
-    if (!isRecord(value)) return null
-    const condition = textValue(value.condition ?? value.description, 'cloud').toLowerCase()
+function liveRestaurants(state: TripState): Restaurant[] {
+  const bucket = liveBucket(state, 'restaurants')
+  const near = textValue(bucket?.near, 'Nearby')
+  return bucketRows(bucket, 'places').map((row, index): Restaurant => {
+    const categories = Array.isArray(row.categories)
+      ? row.categories.filter((item): item is string => typeof item === 'string')
+      : []
+    const meters = numberValue(row.distance_meters)
     return {
-      day: textValue(value.day ?? value.date, `Day ${index + 1}`),
-      condition: condition.includes('rain') ? 'rain' : condition.includes('sun') || condition.includes('clear') ? 'sun' : 'cloud',
-      high: numberValue(value.high ?? value.temp_max ?? value.temperature),
-      low: numberValue(value.low ?? value.temp_min),
-      pop: numberValue(value.pop ?? value.precipitation_probability),
+      id: textValue(row.place_id, `place-${index}`),
+      name: textValue(row.name, 'Local favourite'),
+      cuisine: categories[0] ?? 'Local',
+      area: textValue(row.address, near),
+      city: near,
+      rating: 0,
+      priceLevel: 2,
+      distance: meters ? `${(meters / 1000).toFixed(1)} km` : '—',
+      highlight: categories.slice(0, 3).join(' · ') || 'Recommended near your stay',
+      image: FOOD_FALLBACK_IMAGE,
+    }
+  })
+}
+
+function weekdayLabel(value: unknown, index: number): string {
+  const parsed = new Date(textValue(value))
+  return Number.isNaN(parsed.getTime())
+    ? `Day ${index + 1}`
+    : parsed.toLocaleDateString('en-US', { weekday: 'short' })
+}
+
+function liveWeather(state: TripState): { city: string; current: DataRecord | null; days: WeatherDay[]; note: string } {
+  const bucket = liveBucket(state, 'weather')
+  const days = bucketRows(bucket, 'daily').map((row, index): WeatherDay => {
+    const conditions = textValue(row.conditions).toLowerCase()
+    const condition = /rain|drizzle|storm|snow/.test(conditions)
+      ? 'rain'
+      : /clear|sun/.test(conditions)
+        ? 'sun'
+        : 'cloud'
+    return {
+      day: weekdayLabel(row.date, index),
+      condition,
+      high: Math.round(numberValue(row.temp_max_c)),
+      low: Math.round(numberValue(row.temp_min_c)),
+      pop: Math.round(numberValue(row.precipitation_chance_pct)),
     } as WeatherDay
-  }).filter((value): value is WeatherDay => value !== null)
-  return { current, days }
+  })
+  return {
+    city: textValue(bucket?.city),
+    current: isRecord(bucket?.current) ? bucket.current : null,
+    days,
+    note: textValue(bucket?.note),
+  }
+}
+
+interface TripSummary {
+  origin: string | null
+  destination: string | null
+  country: string | null
+  dateLabel: string | null
+  center: [number, number] | null
+}
+
+function shortDate(value: unknown): string {
+  const parsed = new Date(textValue(value))
+  return Number.isNaN(parsed.getTime())
+    ? ''
+    : parsed.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })
+}
+
+function tripSummary(state: TripState): TripSummary {
+  const destinations = (Array.isArray(state.destinations) ? state.destinations : []).filter(isRecord)
+  const primary = destinations[0]
+  const start = shortDate(state.start_date)
+  const end = shortDate(state.end_date)
+  const lat = numberValue(primary?.latitude, NaN)
+  const lng = numberValue(primary?.longitude, NaN)
+  return {
+    origin: textValue(state.origin) || null,
+    destination: textValue(primary?.city) || null,
+    country: textValue(primary?.country) || null,
+    dateLabel: start ? (end ? `${start} – ${end}` : start) : null,
+    center: Number.isFinite(lat) && Number.isFinite(lng) ? [lng, lat] : null,
+  }
 }
 
 function SectionHeading({ eyebrow, title, action }: { eyebrow?: string; title: string; action?: string }) {
@@ -161,6 +266,21 @@ function SectionHeading({ eyebrow, title, action }: { eyebrow?: string; title: s
         <h2 className="font-display text-4xl leading-none tracking-[-0.04em] text-[#202a36] md:text-5xl">{title}</h2>
       </div>
       {action && <button className="hidden items-center gap-1 text-sm font-semibold text-[#2a6074] transition hover:text-[#173c4d] sm:flex">{action}<ArrowUpRight size={15} /></button>}
+    </div>
+  )
+}
+
+// Demo fixtures are Tokyo-only. Showing them under a real trip to somewhere else is
+// what made the dashboard look like it never updated, so they are only used before a
+// destination exists — after that, an honest empty state replaces them.
+function NoLiveData({ label, destination }: { label: string; destination: string }) {
+  return (
+    <div className="rounded-[30px] border border-dashed border-[#c8d5da] bg-white/70 p-10 text-center">
+      <Sparkles className="mx-auto text-[#2a6074]" size={30} />
+      <h3 className="mt-4 font-display text-3xl text-[#202a36]">No {label} for {destination} yet</h3>
+      <p className="mx-auto mt-3 max-w-sm text-sm leading-relaxed text-[#71808a]">
+        TripAI hasn't looked these up for this trip. Ask for them in the chat below and they'll appear here.
+      </p>
     </div>
   )
 }
@@ -207,8 +327,9 @@ function SearchBar({ value, onChange, placeholder = 'Search destinations, stays,
   return <label className="flex h-14 items-center gap-3 rounded-2xl border border-[#dce4e7] bg-white px-5 shadow-[0_10px_25px_rgba(32,42,54,0.05)]"><Search size={20} className="text-[#2a6074]" /><input value={value} onChange={(event) => onChange(event.target.value)} placeholder={placeholder} className="w-full bg-transparent text-base text-[#202a36] outline-none placeholder:text-[#98a3aa]" /></label>
 }
 
-function WonderView({ onChange, agentMessage }: { onChange: (view: View) => void; agentMessage?: string }) {
+function WonderView({ onChange, agentMessage, tripState }: { onChange: (view: View) => void; agentMessage?: string; tripState: TripState }) {
   const [query, setQuery] = useState('')
+  const trip = tripSummary(tripState)
   const destination = useMemo(() => featuredDestinations.find((item) => item.name.toLowerCase().includes(query.toLowerCase())) ?? featuredDestinations[0], [query])
   return (
     <div className="space-y-10">
@@ -224,7 +345,7 @@ function WonderView({ onChange, agentMessage }: { onChange: (view: View) => void
         <section><SectionHeading title="Featured destination" action="View all" /><div className="mt-5 grid min-h-[430px] grid-cols-[1.1fr_0.9fr] overflow-hidden rounded-[30px] bg-white shadow-[0_16px_45px_rgba(32,42,54,0.08)]"><div className="relative min-h-[330px]"><img src={destination.image} alt={destination.name} className="absolute inset-0 h-full w-full object-cover" /><div className="absolute inset-0 bg-gradient-to-t from-[#173d4c]/75 via-transparent to-transparent" /><div className="absolute bottom-7 left-7 text-white"><p className="mb-2 text-xs font-semibold uppercase tracking-[0.18em]">{destination.country}</p><h3 className="font-display text-4xl">{destination.name}</h3></div></div><div className="flex flex-col justify-between p-7"><div><Compass className="mb-8 text-[#2a6074]" size={34} strokeWidth={1.5} /><h3 className="font-display text-3xl leading-none text-[#202a36]">A trip made for your kind of curious.</h3><p className="mt-4 text-sm leading-relaxed text-[#71808a]">{destination.blurb}. Discover a slower, more memorable way to see the world.</p></div><button onClick={() => onChange('flights')} className="flex w-fit items-center gap-2 rounded-full bg-[#2a6074] px-5 py-3 text-sm font-bold text-white transition hover:bg-[#173c4d]">Start exploring <ChevronRight size={16} /></button></div></div></section>
         <section><SectionHeading title="Top deals" action="View all" /><div className="mt-5 space-y-4">{topDeals.map((deal) => <article key={deal.id} className="group flex min-h-[126px] overflow-hidden rounded-[26px] bg-white shadow-[0_12px_30px_rgba(32,42,54,0.06)]"><img src={deal.image} alt="" className="w-[38%] object-cover transition duration-700 group-hover:scale-105" /><div className="flex flex-1 items-center justify-between gap-4 p-5"><div><p className="mb-1 text-[11px] font-bold uppercase tracking-[0.16em] text-[#849098]">{deal.discount}</p><h3 className="font-display text-2xl leading-none text-[#202a36]">{deal.title}</h3><p className="mt-2 text-sm text-[#73818a]">{deal.subtitle}</p></div><ArrowUpRight className="shrink-0 text-[#2a6074]" /></div></article>)}</div></section>
       </div>
-      <section><SectionHeading eyebrow="A first draft, just for you" title="Your Japan moodboard" /><div className="mt-5 grid gap-4 md:grid-cols-4">{['Old streets at blue hour', 'One perfect bowl of ramen', 'A quiet mountain trail', 'Coffee worth crossing town for'].map((item, index) => <div key={item} className="group relative min-h-[170px] overflow-hidden rounded-3xl bg-[#2a6074] p-5 text-white"><div className={`absolute inset-0 opacity-60 ${index % 2 ? 'bg-gradient-to-br from-[#799cad] to-[#173c4d]' : 'bg-gradient-to-br from-[#d1a76c] to-[#294c59]'}`} /><div className="relative flex h-full flex-col justify-end"><p className="text-lg font-semibold leading-tight">{item}</p><span className="mt-2 text-xs uppercase tracking-[0.15em] text-white/70">Day {index + 1}</span></div></div>)}</div></section>
+      <section><SectionHeading eyebrow="A first draft, just for you" title={trip.destination ? `Your ${trip.destination} moodboard` : 'Your trip moodboard'} /><div className="mt-5 grid gap-4 md:grid-cols-4">{['Old streets at blue hour', 'One perfect bowl of ramen', 'A quiet mountain trail', 'Coffee worth crossing town for'].map((item, index) => <div key={item} className="group relative min-h-[170px] overflow-hidden rounded-3xl bg-[#2a6074] p-5 text-white"><div className={`absolute inset-0 opacity-60 ${index % 2 ? 'bg-gradient-to-br from-[#799cad] to-[#173c4d]' : 'bg-gradient-to-br from-[#d1a76c] to-[#294c59]'}`} /><div className="relative flex h-full flex-col justify-end"><p className="text-lg font-semibold leading-tight">{item}</p><span className="mt-2 text-xs uppercase tracking-[0.15em] text-white/70">Day {index + 1}</span></div></div>)}</div></section>
     </div>
   )
 }
@@ -232,7 +353,14 @@ function WonderView({ onChange, agentMessage }: { onChange: (view: View) => void
 function FlightsView({ tripState }: { tripState: TripState }) {
   const [menuOpen, setMenuOpen] = useState(false)
   const flightVideo = 'https://d8j0ntlcm91z4.cloudfront.net/user_38xzZboKViGWJOttwIXH07lWA1P/hf_20260328_091828_e240eb17-6edc-4129-ad9d-98678e3fd238.mp4'
-  const routeFlights = liveFlights(tripState).length ? liveFlights(tripState) : flights
+  const live = liveFlights(tripState)
+  const isLive = live.length > 0
+  const trip = tripSummary(tripState)
+  const routeFlights = isLive ? live : trip.destination ? [] : flights
+  const cheapest = routeFlights.reduce((low, item) => (item.price > 0 && item.price < low ? item.price : low), Number.POSITIVE_INFINITY)
+  const originChip = isLive ? routeFlights[0].from : trip.origin ?? 'New Delhi · DEL'
+  const destinationChip = isLive ? routeFlights[0].to : trip.destination ?? 'Tokyo · HND'
+  const fareChip = Number.isFinite(cheapest) ? `From ${routeFlights[0].currency}${currency.format(cheapest)}` : 'Ask TripAI'
   return (
     <div>
       <section className="relative min-h-[760px] overflow-hidden rounded-[34px] bg-gray-50 font-inter text-[#202A36]">
@@ -247,12 +375,13 @@ function FlightsView({ tripState }: { tripState: TripState }) {
         </nav>
         {menuOpen && <div className="absolute left-5 right-5 top-20 z-20 rounded-3xl bg-white/95 p-5 shadow-xl backdrop-blur md:hidden"><div className="grid gap-4 text-lg text-gray-900"><button className="text-left">Start</button><button className="text-left">Story</button><button className="text-left">Rates</button><button className="text-left">Benefits</button><button className="text-left">FAQ</button></div></div>}
         <main className="flex flex-1 items-center justify-center px-6 pb-20 pt-16 text-center md:-mt-24 md:px-10">
-          <div className="max-w-4xl"><p className="mb-4 text-sm font-semibold tracking-wider text-gray-600">TRIPAI FLIGHTS</p><h1 className="font-inter text-6xl font-normal leading-none tracking-tighter text-gray-500 md:text-7xl lg:text-8xl">Premium.<br /><span className="-mt-3 block text-[#202A36]">Personal.</span></h1><p className="mx-auto mb-7 mt-7 max-w-2xl text-lg text-gray-600 md:text-xl">Every route should feel like it was chosen for the way you travel.</p><div className="flex flex-wrap justify-center gap-4"><button className="rounded-full bg-gray-300 px-5 py-2.5 font-medium text-gray-800 transition-colors hover:bg-gray-400">Discover flights</button><button className="rounded-full bg-[#202A36] px-5 py-2.5 font-medium text-white transition-colors hover:bg-[#1a2229]">Plan this route</button></div><div className="mx-auto mt-10 grid max-w-xl grid-cols-3 gap-2 rounded-3xl border border-white/60 bg-white/45 p-3 text-left shadow-sm backdrop-blur-md"><div className="rounded-2xl bg-white/70 p-3"><p className="text-[10px] uppercase tracking-wider text-gray-500">From</p><p className="mt-1 text-sm font-semibold">New Delhi · DEL</p></div><div className="rounded-2xl bg-white/70 p-3"><p className="text-[10px] uppercase tracking-wider text-gray-500">To</p><p className="mt-1 text-sm font-semibold">Tokyo · HND</p></div><div className="rounded-2xl bg-white/70 p-3"><p className="text-[10px] uppercase tracking-wider text-gray-500">Sample fare</p><p className="mt-1 text-sm font-semibold">From ₹39,990</p></div></div></div>
+          <div className="max-w-4xl"><p className="mb-4 text-sm font-semibold tracking-wider text-gray-600">TRIPAI FLIGHTS</p><h1 className="font-inter text-6xl font-normal leading-none tracking-tighter text-gray-500 md:text-7xl lg:text-8xl">Premium.<br /><span className="-mt-3 block text-[#202A36]">Personal.</span></h1><p className="mx-auto mb-7 mt-7 max-w-2xl text-lg text-gray-600 md:text-xl">Every route should feel like it was chosen for the way you travel.</p><div className="flex flex-wrap justify-center gap-4"><button className="rounded-full bg-gray-300 px-5 py-2.5 font-medium text-gray-800 transition-colors hover:bg-gray-400">Discover flights</button><button className="rounded-full bg-[#202A36] px-5 py-2.5 font-medium text-white transition-colors hover:bg-[#1a2229]">Plan this route</button></div><div className="mx-auto mt-10 grid max-w-xl grid-cols-3 gap-2 rounded-3xl border border-white/60 bg-white/45 p-3 text-left shadow-sm backdrop-blur-md"><div className="rounded-2xl bg-white/70 p-3"><p className="text-[10px] uppercase tracking-wider text-gray-500">From</p><p className="mt-1 text-sm font-semibold">{originChip}</p></div><div className="rounded-2xl bg-white/70 p-3"><p className="text-[10px] uppercase tracking-wider text-gray-500">To</p><p className="mt-1 text-sm font-semibold">{destinationChip}</p></div><div className="rounded-2xl bg-white/70 p-3"><p className="text-[10px] uppercase tracking-wider text-gray-500">{isLive ? 'Cheapest fare' : 'Sample fare'}</p><p className="mt-1 text-sm font-semibold">{fareChip}</p></div></div></div>
         </main>
       </div>
       </section>
       <section className="mt-6 rounded-[30px] bg-white/70 p-5 shadow-[0_12px_30px_rgba(32,42,54,0.05)] backdrop-blur md:p-7">
-        <div className="mb-5 flex items-end justify-between gap-4"><div><p className="mb-2 text-[11px] font-bold uppercase tracking-[0.22em] text-[#7b8792]">Live or demo availability</p><h2 className="font-display text-3xl text-[#202a36] md:text-4xl">More routes to explore</h2></div><span className="rounded-full bg-[#e9f2f5] px-3 py-1.5 text-xs font-semibold text-[#2a6074]">{liveFlights(tripState).length ? 'Backend results' : 'Demo results'}</span></div>
+        <div className="mb-5 flex items-end justify-between gap-4"><div><p className="mb-2 text-[11px] font-bold uppercase tracking-[0.22em] text-[#7b8792]">Live or demo availability</p><h2 className="font-display text-3xl text-[#202a36] md:text-4xl">More routes to explore</h2></div><span className="rounded-full bg-[#e9f2f5] px-3 py-1.5 text-xs font-semibold text-[#2a6074]">{isLive ? 'Live results' : routeFlights.length ? 'Demo results' : 'Nothing fetched yet'}</span></div>
+        {!routeFlights.length && <NoLiveData label="flights" destination={trip.destination ?? 'this trip'} />}
         <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">{routeFlights.map((flight) => <article key={flight.id} className="rounded-2xl border border-[#e8eef0] bg-white p-4"><div className="flex items-start justify-between gap-3"><div><p className="font-semibold text-[#202a36]">{flight.airline}</p><p className="mt-1 text-xs text-[#849098]">{flight.from} → {flight.to} · {flight.stops === 0 ? 'Non-stop' : `${flight.stops} stop`}</p></div><span className="rounded-xl bg-[#e9f2f5] px-2.5 py-1 text-xs font-bold text-[#2a6074]">{flight.airlineCode}</span></div><div className="mt-4 flex items-end justify-between border-t border-[#eef2f3] pt-3"><p className="font-display text-2xl text-[#202a36]">{flight.currency}{currency.format(flight.price)}</p><p className="text-xs text-[#849098]">{flight.duration}</p></div></article>)}</div>
       </section>
     </div>
@@ -300,20 +429,37 @@ function TrainsView() {
 }
 
 function HotelsView({ tripState }: { tripState: TripState }) {
-  const stayOptions = liveHotels(tripState).length ? liveHotels(tripState) : hotels
-  return <div className="space-y-8"><div className="relative min-h-[240px] overflow-hidden rounded-[32px] bg-[#173c4d] text-white"><video src="/videos/hotel.mp4" autoPlay muted loop playsInline className="absolute inset-0 h-full w-full object-cover opacity-55" /><div className="absolute inset-0 bg-gradient-to-r from-[#102d39]/90 via-[#102d39]/45 to-transparent" /><div className="relative max-w-xl p-8 md:p-12"><p className="mb-3 text-[11px] font-bold uppercase tracking-[0.22em] text-white/70">Stay somewhere memorable</p><h1 className="font-display text-5xl leading-[0.9] tracking-[-0.05em] md:text-6xl">A room with a point of view.</h1><p className="mt-4 max-w-md text-sm leading-relaxed text-white/75">Handpicked stays in the neighbourhoods that make a city feel like itself.</p></div></div><div className="flex flex-wrap items-center justify-between gap-3"><SectionHeading title="Stays in Tokyo & Kyoto" /><button className="flex items-center gap-2 rounded-full bg-white px-4 py-2 text-sm font-semibold text-[#62727c]"><SlidersHorizontal size={15} /> Refine</button></div><div className="grid gap-5 md:grid-cols-2 xl:grid-cols-3">{stayOptions.map((hotel) => <article key={hotel.id} className="group overflow-hidden rounded-[26px] bg-white shadow-[0_12px_30px_rgba(32,42,54,0.06)]"><div className="relative h-48 overflow-hidden"><img src={hotel.image} alt={hotel.name} className="h-full w-full object-cover transition duration-700 group-hover:scale-105" /><span className="absolute right-4 top-4 rounded-full bg-white/90 px-3 py-1 text-xs font-bold text-[#202a36]">{hotel.rating || '—'} <span className="text-amber-500">★</span></span></div><div className="p-5"><p className="text-[10px] font-bold uppercase tracking-[0.17em] text-[#849098]">{hotel.area} · {hotel.city}</p><h3 className="mt-2 font-display text-2xl text-[#202a36]">{hotel.name}</h3><div className="mt-4 flex flex-wrap gap-2">{hotel.tags.map((tag) => <span key={tag} className="rounded-full bg-[#f3f6f7] px-2.5 py-1 text-[11px] font-semibold text-[#61717a]">{tag}</span>)}</div><div className="mt-5 flex items-end justify-between border-t border-[#eef2f3] pt-4"><p><span className="font-display text-2xl text-[#202a36]">{hotel.currency}{currency.format(hotel.pricePerNight)}</span><span className="text-xs text-[#849098]"> / night</span></p><button className="rounded-full bg-[#2a6074] px-4 py-2 text-sm font-bold text-white">Explore</button></div></div></article>)}</div></div>
+  const live = liveHotels(tripState)
+  const trip = tripSummary(tripState)
+  const stayOptions = live.length ? live : trip.destination ? [] : hotels
+  const place = live[0]?.city || trip.destination
+  return <div className="space-y-8"><div className="relative min-h-[240px] overflow-hidden rounded-[32px] bg-[#173c4d] text-white"><video src="/videos/hotel.mp4" autoPlay muted loop playsInline className="absolute inset-0 h-full w-full object-cover opacity-55" /><div className="absolute inset-0 bg-gradient-to-r from-[#102d39]/90 via-[#102d39]/45 to-transparent" /><div className="relative max-w-xl p-8 md:p-12"><p className="mb-3 text-[11px] font-bold uppercase tracking-[0.22em] text-white/70">Stay somewhere memorable</p><h1 className="font-display text-5xl leading-[0.9] tracking-[-0.05em] md:text-6xl">A room with a point of view.</h1><p className="mt-4 max-w-md text-sm leading-relaxed text-white/75">Handpicked stays in the neighbourhoods that make a city feel like itself.</p></div></div><div className="flex flex-wrap items-center justify-between gap-3"><SectionHeading eyebrow={live.length ? 'Live availability' : 'Demo availability'} title={place ? `Stays in ${place}` : 'Stays for your trip'} /><button className="flex items-center gap-2 rounded-full bg-white px-4 py-2 text-sm font-semibold text-[#62727c]"><SlidersHorizontal size={15} /> Refine</button></div>{!stayOptions.length && <NoLiveData label="stays" destination={place ?? 'this trip'} />}<div className="grid gap-5 md:grid-cols-2 xl:grid-cols-3">{stayOptions.map((hotel) => <article key={hotel.id} className="group overflow-hidden rounded-[26px] bg-white shadow-[0_12px_30px_rgba(32,42,54,0.06)]"><div className="relative h-48 overflow-hidden"><img src={hotel.image} alt={hotel.name} className="h-full w-full object-cover transition duration-700 group-hover:scale-105" /><span className="absolute right-4 top-4 rounded-full bg-white/90 px-3 py-1 text-xs font-bold text-[#202a36]">{hotel.rating || '—'} <span className="text-amber-500">★</span></span></div><div className="p-5"><p className="text-[10px] font-bold uppercase tracking-[0.17em] text-[#849098]">{hotel.area} · {hotel.city}</p><h3 className="mt-2 font-display text-2xl text-[#202a36]">{hotel.name}</h3><div className="mt-4 flex flex-wrap gap-2">{hotel.tags.map((tag) => <span key={tag} className="rounded-full bg-[#f3f6f7] px-2.5 py-1 text-[11px] font-semibold text-[#61717a]">{tag}</span>)}</div><div className="mt-5 flex items-end justify-between border-t border-[#eef2f3] pt-4"><p><span className="font-display text-2xl text-[#202a36]">{hotel.currency}{currency.format(hotel.pricePerNight)}</span><span className="text-xs text-[#849098]"> / night</span></p><button className="rounded-full bg-[#2a6074] px-4 py-2 text-sm font-bold text-white">Explore</button></div></div></article>)}</div></div>
 }
 
-function RestaurantsView() {
-  return <div className="space-y-8"><div className="relative min-h-[240px] overflow-hidden rounded-[32px] bg-[#202a36] text-white"><video src="/videos/restaurant.mp4" autoPlay muted loop playsInline className="absolute inset-0 h-full w-full object-cover opacity-50" /><div className="absolute inset-0 bg-gradient-to-r from-[#202a36]/95 via-[#202a36]/45 to-transparent" /><div className="relative max-w-xl p-8 md:p-12"><p className="mb-3 text-[11px] font-bold uppercase tracking-[0.22em] text-white/70">Eat like you belong</p><h1 className="font-display text-5xl leading-[0.9] tracking-[-0.05em] md:text-6xl">Follow the good smells.</h1><p className="mt-4 max-w-md text-sm leading-relaxed text-white/75">Local favourites, tiny counters, and the tables worth planning a day around.</p></div></div><SectionHeading title="Places worth the detour" action="View all" /><div className="grid gap-5 md:grid-cols-2 xl:grid-cols-3">{restaurants.map((restaurant) => <article key={restaurant.id} className="overflow-hidden rounded-[26px] bg-white shadow-[0_12px_30px_rgba(32,42,54,0.06)]"><img src={restaurant.image} alt={restaurant.name} className="h-48 w-full object-cover" /><div className="p-5"><div className="flex items-center justify-between"><p className="text-[10px] font-bold uppercase tracking-[0.17em] text-[#849098]">{restaurant.cuisine} · {restaurant.area}</p><span className="text-sm font-bold text-amber-500">★ {restaurant.rating}</span></div><h3 className="mt-2 font-display text-2xl text-[#202a36]">{restaurant.name}</h3><p className="mt-2 text-sm leading-relaxed text-[#71808a]">{restaurant.highlight}</p><div className="mt-5 flex items-center justify-between border-t border-[#eef2f3] pt-4 text-sm"><span className="font-semibold text-[#62727c]">{'₹'.repeat(restaurant.priceLevel)} <span className="text-[#c3cdd1]">{'₹'.repeat(4 - restaurant.priceLevel)}</span></span><span className="flex items-center gap-1 text-[#62727c]"><MapPin size={14} />{restaurant.distance}</span></div></div></article>)}</div></div>
+function RestaurantsView({ tripState }: { tripState: TripState }) {
+  const live = liveRestaurants(tripState)
+  const trip = tripSummary(tripState)
+  const tables = live.length ? live : trip.destination ? [] : restaurants
+  return <div className="space-y-8"><div className="relative min-h-[240px] overflow-hidden rounded-[32px] bg-[#202a36] text-white"><video src="/videos/restaurant.mp4" autoPlay muted loop playsInline className="absolute inset-0 h-full w-full object-cover opacity-50" /><div className="absolute inset-0 bg-gradient-to-r from-[#202a36]/95 via-[#202a36]/45 to-transparent" /><div className="relative max-w-xl p-8 md:p-12"><p className="mb-3 text-[11px] font-bold uppercase tracking-[0.22em] text-white/70">Eat like you belong</p><h1 className="font-display text-5xl leading-[0.9] tracking-[-0.05em] md:text-6xl">Follow the good smells.</h1><p className="mt-4 max-w-md text-sm leading-relaxed text-white/75">Local favourites, tiny counters, and the tables worth planning a day around.</p></div></div><SectionHeading eyebrow={live.length ? 'Live results' : 'Demo results'} title="Places worth the detour" action="View all" />{!tables.length && <NoLiveData label="restaurants" destination={trip.destination ?? 'this trip'} />}<div className="grid gap-5 md:grid-cols-2 xl:grid-cols-3">{tables.map((restaurant) => <article key={restaurant.id} className="overflow-hidden rounded-[26px] bg-white shadow-[0_12px_30px_rgba(32,42,54,0.06)]"><img src={restaurant.image} alt={restaurant.name} className="h-48 w-full object-cover" /><div className="p-5"><div className="flex items-center justify-between"><p className="text-[10px] font-bold uppercase tracking-[0.17em] text-[#849098]">{restaurant.cuisine} · {restaurant.area}</p>{restaurant.rating > 0 && <span className="text-sm font-bold text-amber-500">★ {restaurant.rating}</span>}</div><h3 className="mt-2 font-display text-2xl text-[#202a36]">{restaurant.name}</h3><p className="mt-2 text-sm leading-relaxed text-[#71808a]">{restaurant.highlight}</p><div className="mt-5 flex items-center justify-between border-t border-[#eef2f3] pt-4 text-sm"><span className="font-semibold text-[#62727c]">{'₹'.repeat(restaurant.priceLevel)} <span className="text-[#c3cdd1]">{'₹'.repeat(4 - restaurant.priceLevel)}</span></span><span className="flex items-center gap-1 text-[#62727c]"><MapPin size={14} />{restaurant.distance}</span></div></div></article>)}</div></div>
 }
 
 function WeatherView({ tripState }: { tripState: TripState }) {
   const weather = liveWeather(tripState)
-  const forecast = weather.days.length ? weather.days : weatherForecast
-  const currentTemp = numberValue(weather.current?.temp ?? weather.current?.temperature, 26)
-  const currentDescription = textValue(weather.current?.description ?? weather.current?.conditions, 'Clear skies')
-  return <div className="space-y-8"><SectionHeading eyebrow="Tokyo, Japan · October 12–19" title="Pack for the feeling" /><div className="grid gap-5 lg:grid-cols-[0.9fr_1.6fr]"><div className="rounded-[30px] bg-[#2a6074] p-8 text-white shadow-[0_14px_35px_rgba(42,96,116,0.2)]"><div className="flex items-start justify-between"><div><p className="text-sm text-white/70">Live trip weather</p><h3 className="mt-3 font-display text-7xl leading-none">{currentTemp}°</h3></div><CloudSun size={54} strokeWidth={1.3} /></div><div className="mt-14 flex items-center justify-between border-t border-white/20 pt-4 text-sm"><span>{currentDescription}</span><span>{weather.days.length ? 'Backend forecast' : 'Demo forecast'}</span></div></div><div className="rounded-[30px] bg-white p-6 shadow-[0_12px_30px_rgba(32,42,54,0.06)]"><div className="mb-5 flex items-center justify-between"><h3 className="font-display text-2xl text-[#202a36]">Five-day outlook</h3><span className="text-xs font-semibold text-[#849098]">°C</span></div><div className="grid grid-cols-5 gap-2">{forecast.map((day) => <div key={day.day} className="rounded-2xl bg-[#f4f7f8] p-3 text-center"><p className="text-xs font-bold text-[#62727c]">{day.day}</p><div className="my-5 flex justify-center text-[#2a6074]">{day.condition === 'rain' ? <CloudRain size={24} /> : day.condition === 'cloud' ? <CloudSun size={24} /> : <Sparkles size={23} />}</div><p className="font-semibold text-[#202a36]">{day.high}° <span className="font-normal text-[#9aa6ad]">{day.low}°</span></p><p className="mt-2 text-[10px] text-[#849098]">{day.pop}% rain</p></div>)}</div></div></div><div className="grid gap-4 md:grid-cols-3"><div className="rounded-3xl bg-white p-5"><CalendarDays className="text-[#2a6074]" size={20} /><p className="mt-6 text-sm text-[#849098]">Best day for a hike</p><p className="mt-1 font-semibold text-[#202a36]">Tuesday · clear & cool</p></div><div className="rounded-3xl bg-white p-5"><Footprints className="text-[#2a6074]" size={20} /><p className="mt-6 text-sm text-[#849098]">Bring along</p><p className="mt-1 font-semibold text-[#202a36]">A light jacket + good shoes</p></div><div className="rounded-3xl bg-white p-5"><CloudRain className="text-[#2a6074]" size={20} /><p className="mt-6 text-sm text-[#849098]">Rain watch</p><p className="mt-1 font-semibold text-[#202a36]">Thursday afternoon</p></div></div></div>
+  const trip = tripSummary(tripState)
+  const hasLive = Boolean(weather.current) || weather.days.length > 0
+  // Beyond the 5-day horizon the backend deliberately returns no daily rows. Filling
+  // that gap with fixtures would be inventing a forecast the API refused to give.
+  const forecast = weather.days.length ? weather.days : hasLive || trip.destination ? [] : weatherForecast
+  const currentTemp = Math.round(numberValue(weather.current?.temp_c, 26))
+  const currentDescription = textValue(weather.current?.conditions, 'Clear skies')
+  const place = [weather.city || trip.destination, trip.country].filter(Boolean).join(', ')
+  const eyebrow = [place || 'Your trip', trip.dateLabel].filter(Boolean).join(' · ')
+  const driest = forecast.reduce((best, day) => (day.pop < best.pop ? day : best), forecast[0])
+  const wettest = forecast.reduce((worst, day) => (day.pop > worst.pop ? day : worst), forecast[0])
+  if (!hasLive && trip.destination) {
+    return <div className="space-y-8"><SectionHeading eyebrow={eyebrow} title="Pack for the feeling" /><NoLiveData label="weather" destination={trip.destination} /></div>
+  }
+  return <div className="space-y-8"><SectionHeading eyebrow={eyebrow} title="Pack for the feeling" />{weather.note && <p className="rounded-3xl bg-[#fdf3e3] px-6 py-4 text-sm leading-relaxed text-[#7a5c2e]">{weather.note}</p>}<div className="grid gap-5 lg:grid-cols-[0.9fr_1.6fr]"><div className="rounded-[30px] bg-[#2a6074] p-8 text-white shadow-[0_14px_35px_rgba(42,96,116,0.2)]"><div className="flex items-start justify-between"><div><p className="text-sm text-white/70">Live trip weather</p><h3 className="mt-3 font-display text-7xl leading-none">{currentTemp}°</h3></div><CloudSun size={54} strokeWidth={1.3} /></div><div className="mt-14 flex items-center justify-between border-t border-white/20 pt-4 text-sm"><span className="capitalize">{currentDescription}</span><span>{weather.days.length ? 'Live forecast' : 'Demo forecast'}</span></div></div><div className="rounded-[30px] bg-white p-6 shadow-[0_12px_30px_rgba(32,42,54,0.06)]"><div className="mb-5 flex items-center justify-between"><h3 className="font-display text-2xl text-[#202a36]">Five-day outlook</h3><span className="text-xs font-semibold text-[#849098]">°C</span></div>{!forecast.length && <p className="rounded-2xl bg-[#f4f7f8] p-5 text-sm leading-relaxed text-[#71808a]">No daily forecast is available for these dates yet — only current conditions.</p>}<div className="grid grid-cols-5 gap-2">{forecast.map((day) => <div key={day.day} className="rounded-2xl bg-[#f4f7f8] p-3 text-center"><p className="text-xs font-bold text-[#62727c]">{day.day}</p><div className="my-5 flex justify-center text-[#2a6074]">{day.condition === 'rain' ? <CloudRain size={24} /> : day.condition === 'cloud' ? <CloudSun size={24} /> : <Sparkles size={23} />}</div><p className="font-semibold text-[#202a36]">{day.high}° <span className="font-normal text-[#9aa6ad]">{day.low}°</span></p><p className="mt-2 text-[10px] text-[#849098]">{day.pop}% rain</p></div>)}</div></div></div><div className="grid gap-4 md:grid-cols-3"><div className="rounded-3xl bg-white p-5"><CalendarDays className="text-[#2a6074]" size={20} /><p className="mt-6 text-sm text-[#849098]">Best day to be outside</p><p className="mt-1 font-semibold text-[#202a36]">{driest ? `${driest.day} · ${driest.high}°, ${driest.pop}% rain` : 'Ask TripAI'}</p></div><div className="rounded-3xl bg-white p-5"><Footprints className="text-[#2a6074]" size={20} /><p className="mt-6 text-sm text-[#849098]">Bring along</p><p className="mt-1 font-semibold text-[#202a36]">A light jacket + good shoes</p></div><div className="rounded-3xl bg-white p-5"><CloudRain className="text-[#2a6074]" size={20} /><p className="mt-6 text-sm text-[#849098]">Rain watch</p><p className="mt-1 font-semibold text-[#202a36]">{wettest && wettest.pop > 0 ? `${wettest.day} · ${wettest.pop}% chance` : 'Nothing in the forecast'}</p></div></div></div>
 }
 
 type RouteCollection = FeatureCollection<Geometry>
@@ -334,14 +480,14 @@ function visitPositions(value: unknown, visit: (position: Position) => void) {
   value.forEach((child) => visitPositions(child, visit))
 }
 
-function MapCanvas({ route }: { route: RouteCollection }) {
+function MapCanvas({ route, center }: { route: RouteCollection; center: [number, number] | null }) {
   const containerRef = useRef<HTMLDivElement>(null)
   useEffect(() => {
     if (!containerRef.current) return
     const map = new maplibregl.Map({
       container: containerRef.current,
       style: 'https://demotiles.maplibre.org/style.json',
-      center: [139.6917, 35.6895],
+      center: center ?? [78.9629, 20.5937],
       zoom: 5,
       attributionControl: { compact: true },
     })
@@ -357,7 +503,7 @@ function MapCanvas({ route }: { route: RouteCollection }) {
       if (!bounds.isEmpty()) map.fitBounds(bounds, { padding: 80, duration: 0 })
     })
     return () => map.remove()
-  }, [route])
+  }, [route, center])
   return <div ref={containerRef} className="absolute inset-0" aria-label="Trip route map" />
 }
 
@@ -375,15 +521,15 @@ function MapView({ tripState, sessionId }: { tripState: TripState; sessionId: st
     }).catch(() => undefined).finally(() => { if (!cancelled) setLoading(false) })
     return () => { cancelled = true }
   }, [sessionId, tripState.route])
-  return <div className="space-y-8"><SectionHeading eyebrow="Your trip at a glance" title="Move through the story" /><div className="relative min-h-[560px] overflow-hidden rounded-[32px] bg-[#dce7e7] shadow-[0_14px_35px_rgba(32,42,54,0.08)]">{route ? <MapCanvas route={route} /> : <div className="absolute inset-0 grid place-items-center bg-[radial-gradient(circle_at_30%_20%,#f5fbf8_0,transparent_28%),linear-gradient(135deg,#dce7e7,#c3d7d4)] p-8 text-center"><div className="max-w-sm rounded-3xl bg-white/90 p-7 shadow-xl backdrop-blur"><MapPin className="mx-auto text-[#2a6074]" size={34} /><h3 className="mt-4 font-display text-3xl text-[#202a36]">Your route will appear here</h3><p className="mt-3 text-sm leading-relaxed text-[#71808a]">{loading ? 'Loading the GeoJSON route from your TripAI session…' : 'Ask TripAI for a route and this MapLibre map will render it here.'}</p></div></div>}<div className="absolute bottom-6 left-6 right-6 flex flex-col justify-between gap-4 rounded-3xl bg-white/90 p-5 backdrop-blur md:flex-row md:items-center"><div><p className="text-[10px] font-bold uppercase tracking-[0.15em] text-[#849098]">Backend GeoJSON · MapLibre GL JS</p><p className="mt-1 font-semibold text-[#202a36]">{route ? 'Route loaded from this session' : 'No route data yet'}</p></div><span className="rounded-full bg-[#e9f2f5] px-4 py-2 text-xs font-bold text-[#2a6074]">{route ? 'Route ready' : 'Waiting for route'}</span></div></div></div>
+  return <div className="space-y-8"><SectionHeading eyebrow="Your trip at a glance" title="Move through the story" /><div className="relative min-h-[560px] overflow-hidden rounded-[32px] bg-[#dce7e7] shadow-[0_14px_35px_rgba(32,42,54,0.08)]">{route ? <MapCanvas route={route} center={tripSummary(tripState).center} /> :<div className="absolute inset-0 grid place-items-center bg-[radial-gradient(circle_at_30%_20%,#f5fbf8_0,transparent_28%),linear-gradient(135deg,#dce7e7,#c3d7d4)] p-8 text-center"><div className="max-w-sm rounded-3xl bg-white/90 p-7 shadow-xl backdrop-blur"><MapPin className="mx-auto text-[#2a6074]" size={34} /><h3 className="mt-4 font-display text-3xl text-[#202a36]">Your route will appear here</h3><p className="mt-3 text-sm leading-relaxed text-[#71808a]">{loading ? 'Loading the GeoJSON route from your TripAI session…' : 'Ask TripAI for a route and this MapLibre map will render it here.'}</p></div></div>}<div className="absolute bottom-6 left-6 right-6 flex flex-col justify-between gap-4 rounded-3xl bg-white/90 p-5 backdrop-blur md:flex-row md:items-center"><div><p className="text-[10px] font-bold uppercase tracking-[0.15em] text-[#849098]">Backend GeoJSON · MapLibre GL JS</p><p className="mt-1 font-semibold text-[#202a36]">{route ? 'Route loaded from this session' : 'No route data yet'}</p></div><span className="rounded-full bg-[#e9f2f5] px-4 py-2 text-xs font-bold text-[#2a6074]">{route ? 'Route ready' : 'Waiting for route'}</span></div></div></div>
 }
 
 function ViewContent({ active, onChange, agentMessage, tripState, sessionId }: { active: View; onChange: (view: View) => void; agentMessage?: string; tripState: TripState; sessionId: string | null }) {
-  if (active === 'wonder') return <WonderView onChange={onChange} agentMessage={agentMessage} />
+  if (active === 'wonder') return <WonderView onChange={onChange} agentMessage={agentMessage} tripState={tripState} />
   if (active === 'flights') return <FlightsView tripState={tripState} />
   if (active === 'trains') return <TrainsView />
   if (active === 'hotels') return <HotelsView tripState={tripState} />
-  if (active === 'restaurants') return <RestaurantsView />
+  if (active === 'restaurants') return <RestaurantsView tripState={tripState} />
   if (active === 'weather') return <WeatherView tripState={tripState} />
   return <MapView tripState={tripState} sessionId={sessionId} />
 }
