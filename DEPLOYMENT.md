@@ -36,6 +36,12 @@ and proxies to Render before the SPA fallback. A health GET wakes the backend
 before creating a session; only this GET is retried. The first request after sleep
 may take about a minute before planning begins.
 
+Messages are submitted once to `/session/{id}/message/start`, which returns a job
+ID immediately. The frontend polls `/session/{id}/message/status/{job_id}` for up
+to ten minutes. This avoids Vercel's external-target timeout for long itineraries.
+Jobs are temporary, limited to 64 retained requests, and completed results expire
+after 15 minutes when the next request prunes them. Backend restarts interrupt jobs.
+
 Deployment source is branch `codex/deploy-trip-ai`; `main` was not changed.
 Render is configured to deploy updates to this branch automatically.
 Vercel Git integration is not connected; pushing does not update the frontend.
@@ -49,7 +55,8 @@ Refresh the upload copy before future frontend releases.
 
 ## Verification
 
-- Six backend tests pass, including lightweight guide retrieval.
+- Eight backend tests pass, including guide retrieval, background planning,
+  session isolation, single execution, and terminal failure reporting.
 - Vercel production build completed successfully.
 - Anonymous website, direct `/trip` SPA path, `/api/health`, and hero video return 200.
 - Session creation and subsequent state retrieval work through the website's `/api` proxy.

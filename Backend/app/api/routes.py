@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import time
+import uuid
+from dataclasses import dataclass
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request, status
@@ -46,6 +50,66 @@ class AgentResponse(BaseModel):
     served_by: str | None = None
     tools_used: list[str] = Field(default_factory=list)
     rounds: int = 0
+
+
+@dataclass
+class _MessageJob:
+    session_id: str
+    task: asyncio.Task
+    completed_at: float | None = None
+
+
+_message_jobs: dict[str, _MessageJob] = {}
+
+
+async def close_message_jobs() -> None:
+    tasks = [job.task for job in _message_jobs.values() if not job.task.done()]
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+    _message_jobs.clear()
+
+
+def _finish_job(job: _MessageJob) -> None:
+    job.completed_at = time.monotonic()
+    # Retrieve exceptions even if the browser closes before polling again.
+    if not job.task.cancelled():
+        job.task.exception()
+
+
+@router.post("/session/{session_id}/message/start", status_code=202)
+async def start_message(session_id: str, request: Request) -> dict[str, str]:
+    if not await db.session_exists(session_id):
+        raise HTTPException(status_code=404, detail="Session not found.")
+    now = time.monotonic()
+    for job_id, job in list(_message_jobs.items()):
+        if job.completed_at is not None and now - job.completed_at > 900:
+            _message_jobs.pop(job_id, None)
+    if len(_message_jobs) >= 64:
+        raise HTTPException(status_code=503, detail="The planner is busy. Please try again shortly.")
+    text, user_id, media = await _parse_message_request(request)
+    job_id = uuid.uuid4().hex
+    task = asyncio.create_task(_run_agent_or_http_error(session_id, text, user_id=user_id, media=media))
+    job = _MessageJob(session_id, task)
+    _message_jobs[job_id] = job
+    task.add_done_callback(lambda _: _finish_job(job))
+    return {"job_id": job_id, "status": "pending"}
+
+
+@router.get("/session/{session_id}/message/status/{job_id}")
+async def message_status(session_id: str, job_id: str) -> dict[str, Any]:
+    job = _message_jobs.get(job_id)
+    if job is None or job.session_id != session_id:
+        raise HTTPException(status_code=404, detail="This planning request expired. Please start a new trip.")
+    if not job.task.done():
+        return {"status": "pending"}
+    if job.task.cancelled():
+        raise HTTPException(status_code=503, detail="Planning was interrupted. Please start a new trip.")
+    try:
+        result = job.task.result()
+    except HTTPException as exc:
+        return {"status": "failed", "message": exc.detail}
+    return {"status": "complete", "result": result.model_dump(mode="json")}
 
 
 def _state_payload(state: TripState) -> dict[str, Any]:

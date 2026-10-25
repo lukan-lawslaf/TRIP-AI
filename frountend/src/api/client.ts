@@ -38,13 +38,31 @@ export async function createSession(): Promise<string> {
 }
 
 export async function sendMessage(sessionId: string, text: string): Promise<AgentResponse> {
-  const res = await fetch(`${BASE}/session/${sessionId}/message`, {
+  const res = await fetch(`${BASE}/session/${sessionId}/message/start`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ text }),
   })
   if (!res.ok) throw new Error(`sendMessage ${res.status}`)
-  return res.json() as Promise<AgentResponse>
+  const { job_id } = await res.json() as { job_id: string }
+  const deadline = Date.now() + 10 * 60_000
+  while (Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 2000))
+    let status: Response
+    try {
+      status = await fetch(`${BASE}/session/${sessionId}/message/status/${job_id}`, {
+        signal: AbortSignal.timeout(90_000),
+      })
+    } catch {
+      continue
+    }
+    if (status.status >= 500 || status.status === 429) continue
+    if (!status.ok) throw new Error(`Planning request ${status.status}`)
+    const job = await status.json() as { status: string; result?: AgentResponse; message?: string }
+    if (job.status === 'failed') throw new Error(job.message ?? 'The travel assistant is temporarily unavailable.')
+    if (job.status === 'complete' && job.result) return job.result
+  }
+  throw new Error('Planning is taking longer than expected. Please try again later.')
 }
 
 export async function getSessionState(sessionId: string): Promise<SessionStateResponse> {

@@ -8,7 +8,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.routes import router
+from app.api.routes import close_message_jobs, router
 from app.config import get_settings
 from app.storage import db
 from app.tools.base import close_http_client
@@ -23,6 +23,7 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        await close_message_jobs()
         await close_router()
         await close_http_client()
 
