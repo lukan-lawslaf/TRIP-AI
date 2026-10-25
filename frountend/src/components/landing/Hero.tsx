@@ -1,7 +1,7 @@
 import { useRef, useState } from 'react'
 import { Upload } from 'lucide-react'
 
-const VIDEO_SRC = '/videos/hero.mp4'
+const VIDEO_POSTER = '/videos/hero-poster.jpg'
 
 const PLACEHOLDER =
   "I'm planning a 7-day trip to Japan in October. I love food, hidden cafes, scenic hikes, and want to avoid crowds...."
@@ -17,7 +17,6 @@ function NavButton({ label }: { label: string }) {
 export default function Hero({ onPlan }: { onPlan: (prompt: string) => void }) {
   const fileInputRef = useRef<HTMLInputElement>(null)
   const [fileName, setFileName] = useState<string | null>(null)
-  const [videoReady, setVideoReady] = useState(false)
   const [text, setText] = useState('')
 
   const effectivePrompt = text.trim() || PLACEHOLDER
@@ -30,24 +29,29 @@ export default function Hero({ onPlan }: { onPlan: (prompt: string) => void }) {
           'radial-gradient(circle at 72% 28%, rgba(126, 169, 181, 0.58), transparent 28%), radial-gradient(circle at 22% 72%, rgba(207, 177, 139, 0.45), transparent 30%), linear-gradient(135deg, #dfe8ea 0%, #f6f2ea 52%, #c5d9d8 100%)',
       }}
     >
+      <img
+        src={VIDEO_POSTER}
+        alt=""
+        aria-hidden="true"
+        className="absolute inset-0 z-0 h-full w-full object-cover"
+      />
       <video
         className="absolute inset-0 z-0 h-full w-full object-cover"
-        src={VIDEO_SRC}
+        poster={VIDEO_POSTER}
         autoPlay
         muted
         loop
         playsInline
         aria-hidden="true"
-        onCanPlay={() => setVideoReady(true)}
-        onError={() => setVideoReady(false)}
-      />
+      >
+        <source src="/videos/hero.webm" type="video/webm" />
+        <source src="/videos/hero-h264.mp4" type="video/mp4" />
+      </video>
 
       <div
         className="pointer-events-none absolute inset-x-0 top-0 z-[1] h-[687px]"
         style={{
-          background: videoReady
-            ? 'linear-gradient(180deg, rgba(255,255,255,1) 0%, rgba(255,255,255,0) 100%)'
-            : 'linear-gradient(180deg, rgba(255,255,255,0.68) 0%, rgba(255,255,255,0.06) 100%)',
+          background: 'linear-gradient(180deg, rgba(255,255,255,1) 0%, rgba(255,255,255,0) 100%)',
         }}
       />
 
