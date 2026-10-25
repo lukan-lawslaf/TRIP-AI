@@ -1,0 +1,10 @@
+# Serving dependencies for the free backend; no local PyTorch model.
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+pydantic>=2.11.7,<3
+pydantic-settings==2.7.1
+httpx==0.28.1
+python-multipart==0.0.20
+tenacity==9.0.0
+rank-bm25==0.2.2
+redis==5.2.1

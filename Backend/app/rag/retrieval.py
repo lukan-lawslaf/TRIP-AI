@@ -42,14 +42,27 @@ class HybridIndex:
         self._lock = asyncio.Lock()
 
     async def _ensure_ready(self) -> None:
-        if self._collection is not None and self._bm25 is not None:
+        if self._bm25 is not None:
             return
         async with self._lock:
-            if self._collection is not None and self._bm25 is not None:
+            if self._bm25 is not None:
                 return
             await asyncio.to_thread(self._load_sync)
 
     def _load_sync(self) -> None:
+        from rank_bm25 import BM25Okapi
+
+        if get_settings().rag_mode == "lexical":
+            self._documents = [
+                _StoredDocument(row["id"], row["text"], {
+                    "title": row["title"], "destination": row["destination"],
+                    "source": row["source"],
+                }) for row in DEFAULT_DOCUMENTS
+            ]
+            self._bm25 = BM25Okapi([
+                _tokens(f"{doc.metadata['title']} {doc.text}") for doc in self._documents
+            ])
+            return
         try:
             import chromadb
             from rank_bm25 import BM25Okapi
@@ -117,21 +130,23 @@ class HybridIndex:
         return await asyncio.to_thread(self._query_sync, query, destination, limit)
 
     def _query_sync(self, query: str, destination: str | None, limit: int) -> list[dict[str, Any]]:
-        assert self._collection is not None and self._bm25 is not None and self._embedder is not None
+        assert self._bm25 is not None
         limit = max(1, min(limit, 10))
         lexical_scores = list(self._bm25.get_scores(_tokens(query)))
         lexical_max = max(lexical_scores, default=0.0) or 1.0
         lexical = {document.id: score / lexical_max for document, score in zip(self._documents, lexical_scores)}
 
-        vector = self._embedder.encode(query, normalize_embeddings=True).tolist()
-        semantic_payload = self._collection.query(
-            query_embeddings=[vector],
-            n_results=min(max(limit * 3, 10), len(self._documents)),
-            include=["documents", "metadatas", "distances"],
-        )
-        semantic_ids = (semantic_payload.get("ids") or [[]])[0]
-        semantic_distances = (semantic_payload.get("distances") or [[]])[0]
-        semantic = {str(doc_id): max(0.0, 1.0 - float(distance)) for doc_id, distance in zip(semantic_ids, semantic_distances)}
+        semantic: dict[str, float] = {}
+        if self._embedder is not None and self._collection is not None:
+            vector = self._embedder.encode(query, normalize_embeddings=True).tolist()
+            semantic_payload = self._collection.query(
+                query_embeddings=[vector],
+                n_results=min(max(limit * 3, 10), len(self._documents)),
+                include=["documents", "metadatas", "distances"],
+            )
+            semantic_ids = (semantic_payload.get("ids") or [[]])[0]
+            semantic_distances = (semantic_payload.get("distances") or [[]])[0]
+            semantic = {str(doc_id): max(0.0, 1.0 - float(distance)) for doc_id, distance in zip(semantic_ids, semantic_distances)}
 
         ranked: list[tuple[float, _StoredDocument]] = []
         destination_lower = destination.lower() if destination else None
@@ -174,5 +189,5 @@ async def rag_query(query: str, *, destination: str | None = None, limit: int = 
         source="rag",
         status="ok",
         data={"query": query, "destination": destination, "results": results},
-        meta={"retrieval": "hybrid_bm25_embedding", "count": len(results)},
+        meta={"retrieval": "bm25" if get_settings().rag_mode == "lexical" else "hybrid_bm25_embedding", "count": len(results)},
     )

@@ -1,4 +1,4 @@
-const BASE = (import.meta.env.VITE_API_URL as string | undefined) ?? 'http://localhost:8000'
+const BASE = (import.meta.env.VITE_API_URL as string | undefined) ?? (import.meta.env.DEV ? 'http://localhost:8000' : '/api')
 
 export interface AgentResponse {
   session_id: string
@@ -15,6 +15,18 @@ export interface SessionStateResponse {
 }
 
 export async function createSession(): Promise<string> {
+  // Wake the free backend before submitting a mutation. Only the GET is retried.
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const health = await fetch(`${BASE}/health`, { signal: AbortSignal.timeout(90_000) })
+      if (health.ok) break
+      if (health.status < 500 && health.status !== 429) throw new Error(`health ${health.status}`)
+      if (attempt === 2) throw new Error('Travel assistant is waking up. Please try again.')
+    } catch (error) {
+      if (attempt === 2) throw error
+    }
+    await new Promise((resolve) => setTimeout(resolve, 1500 * (attempt + 1)))
+  }
   const res = await fetch(`${BASE}/session`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },

@@ -44,3 +44,8 @@ logs/
 Thumbs.db
 .idea/
 .vscode/
+.vercel/
+desktop.ini
+
+.vercel
+.env*

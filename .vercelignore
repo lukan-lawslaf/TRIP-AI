@@ -1,0 +1,12 @@
+/.env
+/.env.*
+/.git/
+/.agents/
+/.claude/
+/.mcp.json
+/Backend/
+/node_modules/
+/frountend/node_modules/
+/frountend/dist/
+/.pytest_cache/
+/Projectmemeory.md

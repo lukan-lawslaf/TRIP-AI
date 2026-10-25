@@ -51,7 +51,7 @@ export default function PlanningLoader({
       const t = setTimeout(() => setStep((s) => s + 1), STEP_MS)
       return () => clearTimeout(t)
     }
-    // All steps done — poll until API resolves (max ~10 s extra)
+    // Wait for the API, including the free backend's cold start.
     if (apiDone.current) {
       const t = setTimeout(() => onDone(apiResult.current), 400)
       return () => clearTimeout(t)
@@ -77,7 +77,7 @@ export default function PlanningLoader({
             aria-hidden="true"
           />
           <span className="text-xs font-medium uppercase tracking-[-0.12px] text-white/80">
-            {error ? 'Using demo data — backend offline' : 'TripAI is working on your plan'}
+            {error ? 'Using demo data — backend offline' : 'TripAI is working on your plan — first visit may take a minute'}
           </span>
         </div>
 

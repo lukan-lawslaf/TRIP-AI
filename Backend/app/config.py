@@ -67,6 +67,7 @@ class Settings(BaseSettings):
     chroma_dir: Path = Field(default_factory=lambda: DATA_DIR / "chroma")
     upload_dir: Path = Field(default_factory=lambda: DATA_DIR / "uploads")
     embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
+    rag_mode: str = "hybrid"
 
     # ---- cache ----
     redis_url: str | None = Field(default="redis://localhost:6379/0")
