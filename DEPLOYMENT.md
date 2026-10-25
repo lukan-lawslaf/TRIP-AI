@@ -62,3 +62,8 @@ Refresh the upload copy before future frontend releases.
 - Vercel production build completed successfully.
 - Anonymous website, direct `/trip` SPA path, `/api/health`, and hero video return 200.
 - Session creation and subsequent state retrieval work through the website's `/api` proxy.
+- Final browser verification completed a two-day Kyoto itinerary through the
+  background-job flow and displayed the AI reply in the dashboard. The free
+  OpenRouter fallback succeeded after the primary Google provider failed.
+- AI-provider outages and free-tier rate limits can delay or interrupt planning;
+  successful hosting does not guarantee upstream provider availability.
