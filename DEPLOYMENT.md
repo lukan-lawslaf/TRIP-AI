@@ -41,6 +41,8 @@ ID immediately. The frontend polls `/session/{id}/message/status/{job_id}` for u
 to ten minutes. This avoids Vercel's external-target timeout for long itineraries.
 Jobs are temporary, limited to 64 retained requests, and completed results expire
 after 15 minutes when the next request prunes them. Backend restarts interrupt jobs.
+The orchestrator also has an `openrouter/free` fallback for provider outages or
+retired model IDs; it uses the existing OpenRouter credential.
 
 Deployment source is branch `codex/deploy-trip-ai`; `main` was not changed.
 Render is configured to deploy updates to this branch automatically.

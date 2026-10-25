@@ -151,6 +151,16 @@ MODEL_ROLES: dict[str, list[ModelCandidate]] = {
             supports_vision=True,
             max_output_tokens=8192,
         ),
+        # The free router filters for the tools/vision capabilities in the request.
+        # Keep a live fallback when older provider-specific model IDs disappear.
+        ModelCandidate(
+            model="openrouter/free",
+            provider="openrouter",
+            priority=5,
+            supports_vision=True,
+            supports_json_schema=True,
+            max_output_tokens=8192,
+        ),
     ],
     # Ranks/selects/resolves conflicts over already-fetched tool results.
     # Reasoning job — no tool calling needed, but must honour a JSON schema.
