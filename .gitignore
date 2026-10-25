@@ -46,6 +46,7 @@ Thumbs.db
 .vscode/
 .vercel/
 desktop.ini
+.deployment-staging/
 
 .vercel
 .env*
