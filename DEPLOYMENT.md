@@ -67,3 +67,16 @@ Refresh the upload copy before future frontend releases.
   OpenRouter fallback succeeded after the primary Google provider failed.
 - AI-provider outages and free-tier rate limits can delay or interrupt planning;
   successful hosting does not guarantee upstream provider availability.
+
+## Background compatibility fix
+
+The original hero MP4 uses HEVC Main 10 at 3840x2160, which failed in the user's
+Firefox environment. The landing page now offers 1920x1080 VP9 WebM first and
+8-bit H.264 MP4 second, both without audio. A matching JPEG sits behind the video
+and is also its poster so the artwork remains available when playback is blocked.
+The original source file is retained for future re-encoding.
+
+The production build passed. An isolated Firefox 155 check confirmed that the
+deployed WebM selected successfully, had nonzero video dimensions, advanced its
+playback time, and was not paused. A screenshot verified the background visually.
+The additional blocked-video automation did not complete; its result is unverified.
